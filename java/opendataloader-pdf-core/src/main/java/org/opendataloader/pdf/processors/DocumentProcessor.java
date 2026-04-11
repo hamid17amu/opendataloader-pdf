@@ -98,7 +98,10 @@ public class DocumentProcessor {
         // cleanup static containers
         clearCleanupStep("StaticResources", StaticResources::clear);
         clearCleanupStep("StaticContainers", () -> StaticContainers.updateContainers(null));
-        clearCleanupStep("GFStaticContainers", () -> org.verapdf.gf.model.impl.containers.StaticContainers.updateContainers(null));
+        clearCleanupStep(
+            "GFStaticContainers",
+            org.verapdf.gf.model.impl.containers.StaticContainers::clearAllContainers
+        );
         clearCleanupStep("StaticLayoutContainers", StaticLayoutContainers::clearContainers);
         clearCleanupStep("StaticStorages", StaticStorages::clearAllContainers);
         clearCleanupStep("StaticCoreContainers", StaticCoreContainers::clearAllContainers);
