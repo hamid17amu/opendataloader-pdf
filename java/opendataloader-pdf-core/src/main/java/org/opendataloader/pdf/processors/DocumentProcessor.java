@@ -73,20 +73,40 @@ public class DocumentProcessor {
      * - Closes PDDocument to free OS file handles (required for file deletion)
      * - Clears static containers to remove lingering references
      * Should always be called in a finally block.
- */
+     */
     private static void closePdfResources() throws Exception {
+        Exception closeFailure = null;
         PDDocument document = StaticResources.getDocument();
         if (document != null) {
-            document.close();
+            try {
+                document.close();
+            } catch (Exception e) {
+                closeFailure = e;
+            }
+        }
+
+        try {
+            StaticLayoutContainers.closeContrastRatioConsumer();
+        } catch (Exception e) {
+            if (closeFailure != null) {
+                closeFailure.addSuppressed(e);
+            } else {
+                closeFailure = e;
+            }
         }
 
         // cleanup static containers
         clearCleanupStep("StaticResources", StaticResources::clear);
         clearCleanupStep("StaticContainers", () -> StaticContainers.updateContainers(null));
+        clearCleanupStep("GFStaticContainers", () -> org.verapdf.gf.model.impl.containers.StaticContainers.updateContainers(null));
         clearCleanupStep("StaticLayoutContainers", StaticLayoutContainers::clearContainers);
         clearCleanupStep("StaticStorages", StaticStorages::clearAllContainers);
         clearCleanupStep("StaticCoreContainers", StaticCoreContainers::clearAllContainers);
         clearCleanupStep("StaticXmpCoreContainers", StaticXmpCoreContainers::clearAllContainers);
+
+        if (closeFailure != null) {
+            throw closeFailure;
+        }
     }
 
     /**
@@ -112,6 +132,7 @@ public class DocumentProcessor {
      * @throws IOException if unable to process the file
      */
     public static void processFile(String inputPdfName, Config config) throws IOException {
+        Throwable processingFailure = null;
         try {
             preprocessing(inputPdfName, config);
             calculateDocumentInfo();
@@ -131,14 +152,17 @@ public class DocumentProcessor {
                 config.getFilterConfig().isFilterSensitiveData());
             contentSanitizer.sanitizeContents(contents);
             generateOutputs(inputPdfName, contents, config);
+        } catch (IOException | RuntimeException | Error e) {
+            processingFailure = e;
+            throw e;
         } finally {
             // Ensures resources are always released, even if processing throws an exception
             try {
                 closePdfResources();
             } catch (Exception closeException) {
                 LOGGER.log(Level.WARNING, "Error during PDF resource cleanup", closeException);
-                if (originalException != null) {
-                    originalException.addSuppressed(closeException);
+                if (processingFailure != null) {
+                    processingFailure.addSuppressed(closeException);
                 } else {
                     if (closeException instanceof IOException) {
                         throw (IOException) closeException;
