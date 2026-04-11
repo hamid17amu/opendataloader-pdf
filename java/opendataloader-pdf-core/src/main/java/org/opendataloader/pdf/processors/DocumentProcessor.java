@@ -69,34 +69,38 @@ public class DocumentProcessor {
     private static final Logger LOGGER = Logger.getLogger(DocumentProcessor.class.getCanonicalName());
 
     /**
-     * Releases all PDF-related resources to prevent file locks.
-     * 
-     * Why this is needed:
-     * - PDDocument holds a native file handle
-     * - On Windows, this causes file locking if not closed
-     * - Static containers may retain references → memory leaks
-     */
-    private static void closePdfResources() {
-        try {
-            PDDocument document = StaticResources.getDocument();
-            if (document != null) {
-                // releases OS-level file handle
-                document.close();
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Unable to close PDF document", e);
+     * Releases PDF resources to prevent file locks and memory leaks.
+     * - Closes PDDocument to free OS file handles (required for file deletion)
+     * - Clears static containers to remove lingering references
+     * Should always be called in a finally block.
+ */
+    private static void closePdfResources() throws Exception {
+        PDDocument document = StaticResources.getDocument();
+        if (document != null) {
+            document.close();
         }
 
+        // cleanup static containers
+        clearCleanupStep("StaticResources", StaticResources::clear);
+        clearCleanupStep("StaticContainers", () -> StaticContainers.updateContainers(null));
+        clearCleanupStep("StaticLayoutContainers", StaticLayoutContainers::clearContainers);
+        clearCleanupStep("StaticStorages", StaticStorages::clearAllContainers);
+        clearCleanupStep("StaticCoreContainers", StaticCoreContainers::clearAllContainers);
+        clearCleanupStep("StaticXmpCoreContainers", StaticXmpCoreContainers::clearAllContainers);
+    }
+
+    /**
+     * Executes a cleanup step safely without interrupting subsequent steps.
+     *
+     * Each cleanup action is isolated so that a failure in one step
+     * does not prevent the remaining cleanup operations from running.
+     * Errors are logged for debugging purposes.
+     */
+    private static void clearCleanupStep(String name, Runnable cleanup) {
         try {
-            // Clear static/shared containers to avoid stale references
-            StaticResources.clear();
-            StaticContainers.updateContainers(null);
-            StaticLayoutContainers.clearContainers();
-            StaticStorages.clearAllContainers();
-            StaticCoreContainers.clearAllContainers();
-            StaticXmpCoreContainers.clearAllContainers();
+            cleanup.run();
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Error clearing static containers", e);
+            LOGGER.log(Level.WARNING, "Error clearing " + name, e);
         }
     }
 
@@ -129,7 +133,20 @@ public class DocumentProcessor {
             generateOutputs(inputPdfName, contents, config);
         } finally {
             // Ensures resources are always released, even if processing throws an exception
-            closePdfResources();
+            try {
+                closePdfResources();
+            } catch (Exception closeException) {
+                LOGGER.log(Level.WARNING, "Error during PDF resource cleanup", closeException);
+                if (originalException != null) {
+                    originalException.addSuppressed(closeException);
+                } else {
+                    if (closeException instanceof IOException) {
+                        throw (IOException) closeException;
+                    } else {
+                        throw new IOException("Failed to close PDF resources", closeException);
+                    }
+                }
+            }
         }
     }  
 
