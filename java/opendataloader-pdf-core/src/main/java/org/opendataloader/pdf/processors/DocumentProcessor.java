@@ -69,6 +69,38 @@ public class DocumentProcessor {
     private static final Logger LOGGER = Logger.getLogger(DocumentProcessor.class.getCanonicalName());
 
     /**
+     * Releases all PDF-related resources to prevent file locks.
+     * 
+     * Why this is needed:
+     * - PDDocument holds a native file handle
+     * - On Windows, this causes file locking if not closed
+     * - Static containers may retain references → memory leaks
+     */
+    private static void closePdfResources() {
+        try {
+            PDDocument document = StaticResources.getDocument();
+            if (document != null) {
+                // releases OS-level file handle
+                document.close();
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Unable to close PDF document", e);
+        }
+
+        try {
+            // Clear static/shared containers to avoid stale references
+            StaticResources.clear();
+            StaticContainers.updateContainers(null);
+            StaticLayoutContainers.clearContainers();
+            StaticStorages.clearAllContainers();
+            StaticCoreContainers.clearAllContainers();
+            StaticXmpCoreContainers.clearAllContainers();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error clearing static containers", e);
+        }
+    }
+
+    /**
      * Processes a PDF file and generates the configured outputs.
      *
      * @param inputPdfName the path to the input PDF file
@@ -76,25 +108,30 @@ public class DocumentProcessor {
      * @throws IOException if unable to process the file
      */
     public static void processFile(String inputPdfName, Config config) throws IOException {
-        preprocessing(inputPdfName, config);
-        calculateDocumentInfo();
-        Set<Integer> pagesToProcess = getValidPageNumbers(config);
-        List<List<IObject>> contents;
-        if (StaticLayoutContainers.isUseStructTree()) {
-            contents = TaggedDocumentProcessor.processDocument(inputPdfName, config, pagesToProcess);
-        } else if (config.isHybridEnabled()) {
-            contents = HybridDocumentProcessor.processDocument(inputPdfName, config, pagesToProcess);
-        } else {
-            contents = processDocument(inputPdfName, config, pagesToProcess);
+        try {
+            preprocessing(inputPdfName, config);
+            calculateDocumentInfo();
+            Set<Integer> pagesToProcess = getValidPageNumbers(config);
+            List<List<IObject>> contents;
+            if (StaticLayoutContainers.isUseStructTree()) {
+                contents = TaggedDocumentProcessor.processDocument(inputPdfName, config, pagesToProcess);
+            } else if (config.isHybridEnabled()) {
+                contents = HybridDocumentProcessor.processDocument(inputPdfName, config, pagesToProcess);
+            } else {
+                contents = processDocument(inputPdfName, config, pagesToProcess);
+            }
+            if (config.needsStructuredProcessing()) {
+                sortContents(contents, config);
+            }
+            ContentSanitizer contentSanitizer = new ContentSanitizer(config.getFilterConfig().getFilterRules(),
+                config.getFilterConfig().isFilterSensitiveData());
+            contentSanitizer.sanitizeContents(contents);
+            generateOutputs(inputPdfName, contents, config);
+        } finally {
+            // Ensures resources are always released, even if processing throws an exception
+            closePdfResources();
         }
-        if (config.needsStructuredProcessing()) {
-            sortContents(contents, config);
-        }
-        ContentSanitizer contentSanitizer = new ContentSanitizer(config.getFilterConfig().getFilterRules(),
-            config.getFilterConfig().isFilterSensitiveData());
-        contentSanitizer.sanitizeContents(contents);
-        generateOutputs(inputPdfName, contents, config);
-    }
+    }  
 
     /**
      * Validates and filters page numbers from config against actual document pages.
