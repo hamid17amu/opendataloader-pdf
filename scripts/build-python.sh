@@ -19,8 +19,8 @@ rm -rf dist/
 # Copy README.md from root (gitignored in package dir)
 cp "$ROOT_DIR/README.md" "$PACKAGE_DIR/README.md"
 
-# Build wheel package
-uv build --wheel
+# Build sdist and wheel packages
+uv build
 
 # Install and run tests (include hybrid extras for full test coverage)
 uv sync --extra hybrid
