@@ -3,6 +3,7 @@ package org.opendataloader.pdf.processors;
 import org.opendataloader.pdf.autotagging.ChunksWriter;
 import org.opendataloader.pdf.autotagging.OperatorStreamKey;
 import org.opendataloader.pdf.entities.EnrichedImageChunk;
+import org.opendataloader.pdf.entities.SemanticFootnote;
 import org.opendataloader.pdf.entities.SemanticFormula;
 import org.verapdf.as.ASAtom;
 import org.verapdf.as.io.ASMemoryInStream;
@@ -39,6 +40,10 @@ public class AutoTaggingProcessor {
     private static final Map<OperatorStreamKey, Integer> structParentsIntegers = new LinkedHashMap<>();
     // annotation StructParent entries: int key -> single struct element (Link)
     private static final Map<Integer, COSObject> annotationStructParents = new HashMap<>();
+    // First created struct element per page, used to rewrite page destinations to structure destinations.
+    private static final Map<Integer, COSObject> pageNumberToFirstStructElement = new HashMap<>();
+    // Namespace for PDF 2.0-only structure types (FENote, etc.), created in createStructTreeRoot.
+    private static COSObject pdf2_0Namespace;
     // Caption elements keyed by their linked content ID (Raman's approach from #377)
     private static final Map<Long, SemanticCaption> structElementIdToCaptionMap = new HashMap<>();
     private static boolean isPDF2_0 = false;
@@ -59,6 +64,7 @@ public class AutoTaggingProcessor {
         structParents.clear();
         structParentsIntegers.clear();
         annotationStructParents.clear();
+        pageNumberToFirstStructElement.clear();
         structElementIdToCaptionMap.clear();
         imageChunkFigureCounter = 0;
         isPDF2_0 = document.getVersion() == 2.0F;
@@ -145,6 +151,20 @@ public class AutoTaggingProcessor {
         structTreeRoot.setKey(ASAtom.TYPE, COSName.construct(ASAtom.STRUCT_TREE_ROOT));
         cosDocument.addObject(structTreeRoot);
         structTreeRoot.setKey(ASAtom.PARENT_TREE_NEXT_KEY, COSInteger.construct(document.getNumberOfPages()));
+        // Only emit the PDF 2.0 namespace (pdf2/ssn) when the output is PDF 2.0.
+        // The namespace gates PDF 2.0-only structure types like FENote (tagged
+        // with an explicit /NS to satisfy PDF/UA-2 clause 8.2.4.1). Attaching
+        // /Namespaces on a PDF 1.x file would produce invalid output.
+        pdf2_0Namespace = null;
+        if (isPDF2_0) {
+            pdf2_0Namespace = COSDictionary.construct(ASAtom.NS, TaggedPDFConstants.PDF2_NAMESPACE);
+            pdf2_0Namespace.setNameKey(ASAtom.TYPE, ASAtom.NAMESPACE);
+            pdf2_0Namespace = COSIndirect.construct(pdf2_0Namespace, cosDocument);
+            cosDocument.addObject(pdf2_0Namespace);
+            COSObject namespaces = COSArray.construct();
+            namespaces.add(pdf2_0Namespace);
+            structTreeRoot.setKey(ASAtom.NAMESPACES, namespaces);
+        }
         cosDocument.addChangedObject(catalog.getObject());
         return structTreeRoot;
     }
@@ -198,6 +218,7 @@ public class AutoTaggingProcessor {
         structElement.setKey(ASAtom.P, parent);
         if (pageNumber != null) {
             structElement.setKey(ASAtom.PG, cosDocument.getPDDocument().getPages().get(pageNumber).getObject());
+            pageNumberToFirstStructElement.putIfAbsent(pageNumber, structElement);
         }
         cosDocument.addObject(structElement);
         return structElement;
@@ -343,19 +364,45 @@ public class AutoTaggingProcessor {
                 }
                 // Create Link struct element
                 COSObject linkElem = addStructElement(seDocument, cosDocument, TaggedPDFConstants.LINK, pageNumber);
-                // Set Alt text to URI or "Link"
-                String altText = uriString != null ? uriString : "Link";
-                linkElem.setKey(ASAtom.ALT, COSString.construct(altText.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                // PDF/UA-2 clause 8.9.4.2.1 requires the annotation's Contents and the enclosing
+                // struct element's Alt to be identical when both are present. Prefer any existing
+                // Contents authored on the annotation (accessibility text the author already
+                // wrote), otherwise fall back to URI, then to "Link".
+                String existingContents = annotation.getContents();
+                // Build a single COSString object and use it for both /Contents and
+                // /Alt so PDF/UA-2 clause 8.9.4.2.1 (byte-identity) holds. Hex form
+                // (isHex=true) is required because UTF-16BE code units whose low
+                // byte is 0x5C would be misparsed as a backslash escape inside a
+                // PDF literal string, corrupting non-ASCII text. UTF-16 with BOM
+                // keeps readers from interpreting the string as PDFDocEncoding.
+                COSObject linkTextObject;
+                if (existingContents != null && !existingContents.isEmpty()) {
+                    // Preserve the annotation's existing COSString reference when
+                    // present — re-encoding would change literal/hex form and
+                    // break the equality check.
+                    COSObject contentsObj = annotObj.getKey(ASAtom.CONTENTS);
+                    if (contentsObj != null && contentsObj.getType() == COSObjType.COS_STRING) {
+                        linkTextObject = contentsObj;
+                    } else {
+                        // Non-string /Contents (rare, e.g. indirect/array shape). Build a hex
+                        // UTF-16 COSString from the parsed text and write it back to /Contents
+                        // too so the annotation and /Alt remain byte-identical per §8.9.4.2.1.
+                        linkTextObject = COSString.construct(
+                                existingContents.getBytes(StandardCharsets.UTF_16), true);
+                        annotObj.setKey(ASAtom.CONTENTS, linkTextObject);
+                    }
+                } else {
+                    String altText = uriString != null ? uriString : "Link";
+                    linkTextObject = COSString.construct(
+                            altText.getBytes(StandardCharsets.UTF_16), true);
+                    annotObj.setKey(ASAtom.CONTENTS, linkTextObject);
+                }
+                linkElem.setKey(ASAtom.ALT, linkTextObject);
                 // Assign StructParent integer to annotation and register in parent tree
                 int structParentInt = annotStructParentKey++;
                 annotObj.setKey(ASAtom.STRUCT_PARENT, COSInteger.construct(structParentInt));
-                // Set Contents on annotation if absent.
-                String contents = annotation.getContents();
-                if (contents == null || contents.isEmpty()) {
-                    annotObj.setKey(ASAtom.CONTENTS,
-                        COSString.construct(altText.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-                }
                 annotationStructParents.put(structParentInt, linkElem);
+                rewriteDestinationToStructDestination(annotObj, document, pageNumber);
                 cosDocument.addChangedObject(annotObj);
                 pageChanged = true;
                 // Create OBJR pointing to the annotation
@@ -380,11 +427,92 @@ public class AutoTaggingProcessor {
         }
     }
 
+    /**
+     * Make a Link annotation's destination compliant with PDF/UA-2 clause 8.8 (all internal
+     * destinations must be structure destinations).
+     *
+     * <p>Behaviour differs between annotation {@code /Dest} and action {@code /A /D}:
+     * <ul>
+     *   <li>For annotation {@code /Dest}: veraPDF checks the array's first element is a struct
+     *       element (via {@code at(0).knownKey(S)}), so rewrite the first slot to a struct elem ref.
+     *   <li>For a GoTo action: veraPDF first checks {@code /SD} on the action dict itself, so add
+     *       an {@code /SD [structElem /Fit]} entry alongside (or instead of) the existing {@code /D}.
+     * </ul>
+     */
+    private static void rewriteDestinationToStructDestination(COSObject annotObj, PDDocument document, int annotPageNumber) {
+        COSDocument cosDocument = document.getDocument();
+        COSObject dest = annotObj.getKey(ASAtom.DEST);
+        if (dest != null && !dest.empty()) {
+            COSObject structDestArray = buildStructDestArray(dest, document, annotPageNumber);
+            if (structDestArray != null) {
+                annotObj.setKey(ASAtom.DEST, structDestArray);
+            }
+        }
+        COSObject action = annotObj.getKey(ASAtom.A);
+        if (action == null || action.empty() || action.getType() != COSObjType.COS_DICT) {
+            return;
+        }
+        if (!ASAtom.GO_TO.equals(action.getNameKey(ASAtom.S))) {
+            return;
+        }
+        COSObject d = action.getKey(ASAtom.D);
+        COSObject structDestArray = buildStructDestArray(d, document, annotPageNumber);
+        if (structDestArray != null) {
+            action.setKey(ASAtom.getASAtom("SD"), structDestArray);
+            cosDocument.addChangedObject(action);
+        }
+    }
+
+    /**
+     * Build a {@code [structElem /Fit]} array suitable as a structure destination. Uses the
+     * target page from an array-form page destination when available. Falls back to the
+     * annotation's own page only when the destination is entirely absent — a present-but-
+     * unresolvable destination (named, non-array, or an unmatched page) returns {@code null}
+     * so the caller leaves the original destination untouched rather than silently
+     * redirecting a cross-page link to the annotation's own page.
+     */
+    private static COSObject buildStructDestArray(COSObject originalDest, PDDocument document, int annotPageNumber) {
+        COSObject target = null;
+        boolean destIsPresent = originalDest != null && !originalDest.empty();
+        boolean destIsResolvableArray = destIsPresent
+            && originalDest.getType() == COSObjType.COS_ARRAY && originalDest.size() >= 1;
+        if (destIsResolvableArray) {
+            COSObject first = originalDest.at(0);
+            if (first != null && !first.empty() && first.getType() == COSObjType.COS_DICT
+                    && ASAtom.PAGE.equals(first.getNameKey(ASAtom.TYPE))) {
+                List<PDPage> pages = document.getPages();
+                for (int i = 0; i < pages.size(); i++) {
+                    if (pages.get(i).getObject().getObjectKey().equals(first.getObjectKey())) {
+                        target = pageNumberToFirstStructElement.get(i);
+                        break;
+                    }
+                }
+            }
+        }
+        // Fallback to the annotation's own page only when the destination is entirely
+        // absent. If a destination is present but unresolvable (named destination,
+        // non-array form, or page not found) we must NOT rewrite it to the link's own
+        // page — that silently redirects cross-page GoTo links. Return null so the
+        // caller can leave the destination untouched.
+        if (target == null && !destIsPresent) {
+            target = pageNumberToFirstStructElement.get(annotPageNumber);
+        }
+        if (target == null) {
+            return null;
+        }
+        COSObject arr = COSArray.construct();
+        arr.add(target);
+        arr.add(COSName.construct(ASAtom.getASAtom("Fit")));
+        return arr;
+    }
+
     private static void createStructElem(IObject object, COSObject parentStructElem, COSDocument cosDocument) {
         if (object instanceof SemanticHeading) {
             // Fallback: heading inside a nested context (list/table) — use original level
             createHeadingStructElem((SemanticHeading) object, parentStructElem, cosDocument,
                     ((SemanticHeading) object).getHeadingLevel());
+        } else if (object instanceof SemanticFootnote) {
+            createFootnoteStructElem((SemanticFootnote) object, parentStructElem, cosDocument);
         } else if (object instanceof SemanticParagraph) {
             createParagraphStructElem((SemanticParagraph) object, parentStructElem, cosDocument);
         } else if (object instanceof PDFList) {
@@ -419,6 +547,40 @@ public class AutoTaggingProcessor {
         processTextNode(paragraph, paragraphObject);
     }
 
+    /**
+     * Remove Unicode Private Use Area code points. PDF/UA-2 clause 8.4.3.3 forbids PUA chars in
+     * /Alt entries. Iterates by code point so surrogate pairs for supplementary PUA are handled.
+     */
+    private static String stripPuaCodePoints(String in) {
+        if (in == null || in.isEmpty()) return in;
+        StringBuilder sb = new StringBuilder(in.length());
+        int i = 0;
+        while (i < in.length()) {
+            int cp = in.codePointAt(i);
+            boolean isPua = (cp >= 0xE000 && cp <= 0xF8FF)
+                    || (cp >= 0xF0000 && cp <= 0xFFFFD)
+                    || (cp >= 0x100000 && cp <= 0x10FFFD);
+            if (!isPua) sb.appendCodePoint(cp);
+            i += Character.charCount(cp);
+        }
+        return sb.toString();
+    }
+
+    private static void createFootnoteStructElem(SemanticFootnote footnote, COSObject parent, COSDocument cosDocument) {
+        // FENote + /NS + /NoteType is the PDF 2.0 path (PDF/UA-2 clause 8.2.4.1).
+        // For PDF 1.x output, fall back to the Note standard structure type so the
+        // result is valid for PDF 1.7 tagged-PDF consumers.
+        boolean usePdf2Footnote = isPDF2_0 && pdf2_0Namespace != null;
+        COSObject noteObject = addStructElement(parent, cosDocument,
+                usePdf2Footnote ? TaggedPDFConstants.FENOTE : TaggedPDFConstants.NOTE,
+                footnote.getPageNumber());
+        if (usePdf2Footnote) {
+            noteObject.setKey(ASAtom.NS, pdf2_0Namespace);
+            noteObject.setKey(ASAtom.NOTE_TYPE, COSName.construct(ASAtom.getASAtom("Footnote")));
+        }
+        processTextNode(footnote, noteObject);
+    }
+
     private static void createCaptionStructElem(SemanticCaption caption, COSObject parent, COSDocument cosDocument, boolean isFirstChild) {
         COSObject captionObject = addStructElement(parent, cosDocument, TaggedPDFConstants.CAPTION, caption.getPageNumber(), isFirstChild);
         processTextNode(caption, captionObject);
@@ -437,8 +599,15 @@ public class AutoTaggingProcessor {
         String altText = (image instanceof EnrichedImageChunk && ((EnrichedImageChunk) image).hasDescription())
                 ? ((EnrichedImageChunk) image).sanitizeDescription()
                 : "image " + (++imageChunkFigureCounter);
+        altText = stripPuaCodePoints(altText);
+        if (altText.isEmpty()) {
+            altText = "image " + (++imageChunkFigureCounter);
+        }
+        // Write as hex string (isHex=true). UTF-16BE code units whose low byte is 0x5C (e.g. U+D55C "한")
+        // would be misparsed as a backslash escape inside a PDF literal string, shifting all subsequent
+        // bytes by one and producing PUA code points that fail PDF/UA-2 clause 8.4.3.3.
         figureObject.setKey(ASAtom.ALT,
-                COSString.construct(altText.getBytes(StandardCharsets.UTF_16), false));
+                COSString.construct(altText.getBytes(StandardCharsets.UTF_16), true));
         cosDocument.addChangedObject(figureObject);
         processImageNode(image, figureObject);
         addCaptionIfPresent(image, figureObject, cosDocument);
@@ -451,7 +620,7 @@ public class AutoTaggingProcessor {
         addAttributeToStructElem(formulaObject, ASAtom.LAYOUT, ASAtom.BBOX, COSArray.construct(4, bbox));
         String altText = formula.getLatex().isEmpty() ? "formula" : formula.getLatex();
         formulaObject.setKey(ASAtom.ALT,
-                COSString.construct(altText.getBytes(StandardCharsets.UTF_16), false));
+                COSString.construct(altText.getBytes(StandardCharsets.UTF_16), true));
         cosDocument.addChangedObject(formulaObject);
         addMcidChildren(formula.getStreamInfos(), formula.getPageNumber(), formulaObject);
     }
@@ -466,8 +635,18 @@ public class AutoTaggingProcessor {
             addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.CONTINUED_FROM,
                 COSString.construct(String.valueOf(list.getPreviousList().getRecognizedStructureId()).getBytes()));
         }
-        addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.LIST_NUMBERING,
-            COSName.construct(ListProcessor.getListNumbering(list.getNumberingStyle())));
+        ASAtom numbering = ListProcessor.getListNumbering(list.getNumberingStyle());
+        // ListProcessor.getListNumbering returns null for unmapped styles. Fold
+        // null into NONE so the hasLabel promotion and COSName.construct below
+        // never receive null.
+        if (numbering == null || numbering == ASAtom.NONE) {
+            boolean hasLabel = false;
+            for (ListItem item : list.getListItems()) {
+                if (item.getLabelLength() > 0) { hasLabel = true; break; }
+            }
+            numbering = hasLabel ? ASAtom.ORDERED : ASAtom.NONE;
+        }
+        addAttributeToStructElem(listObject, ASAtom.LIST, ASAtom.LIST_NUMBERING, COSName.construct(numbering));
 
         for (ListItem listItem : list.getListItems()) {
             COSObject listItemObject = addStructElement(listObject, cosDocument, TaggedPDFConstants.LI, listItem.getPageNumber());
@@ -499,31 +678,40 @@ public class AutoTaggingProcessor {
 
     private static COSObject createTableStructElemReturning(TableBorder table, COSObject parent, COSDocument cosDocument) {
         COSObject tableObject = addStructElement(parent, cosDocument, TaggedPDFConstants.TABLE, table.getPageNumber());
+
+        // Flat structure: Table > TR > TH/TD (no THead/TBody wrappers)
+        // First row uses TH + Scope="Column" for header identification.
+        // This is compatible with both Adobe Acrobat and veraPDF PDF/UA-2 validation.
         for (int rowNumber = 0; rowNumber < table.getNumberOfRows(); rowNumber++) {
-            TableBorderRow row = table.getRow(rowNumber);
-            COSObject rowObject = addStructElement(tableObject, cosDocument, TaggedPDFConstants.TR, row.getPageNumber());
-            boolean isHeaderRow = (rowNumber == 0);
-            for (int colNumber = 0; colNumber < table.getNumberOfColumns(); colNumber++) {
-                TableBorderCell cell = row.getCell(colNumber);
-                if (cell.getRowNumber() == rowNumber && cell.getColNumber() == colNumber) {
-                    String cellTag = isHeaderRow ? TaggedPDFConstants.TH : TaggedPDFConstants.TD;
-                    COSObject cellObject = addStructElement(rowObject, cosDocument, cellTag, cell.getPageNumber());
-                    if (isHeaderRow) {
-                        addAttributeToStructElem(cellObject, ASAtom.TABLE,
-                            ASAtom.SCOPE, COSName.construct(ASAtom.getASAtom("Column")));
-                    }
-                    if (cell.getColSpan() != 1) {
-                        addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.COL_SPAN, COSInteger.construct(cell.getColSpan()));
-                    }
-                    if (cell.getRowSpan() != 1) {
-                        addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.ROW_SPAN, COSInteger.construct(cell.getRowSpan()));
-                    }
-                    addKids(cell.getContents(), cellObject, cosDocument);
-                }
-            }
+            addTableRow(table, rowNumber, tableObject, cosDocument, rowNumber == 0);
         }
+
         addCaptionIfPresent(table, tableObject, cosDocument);
         return tableObject;
+    }
+
+    private static void addTableRow(TableBorder table, int rowNumber, COSObject parent,
+                                    COSDocument cosDocument, boolean isHeaderRow) {
+        TableBorderRow row = table.getRow(rowNumber);
+        COSObject rowObject = addStructElement(parent, cosDocument, TaggedPDFConstants.TR, row.getPageNumber());
+        for (int colNumber = 0; colNumber < table.getNumberOfColumns(); colNumber++) {
+            TableBorderCell cell = row.getCell(colNumber);
+            if (cell.getRowNumber() == rowNumber && cell.getColNumber() == colNumber) {
+                String cellTag = isHeaderRow ? TaggedPDFConstants.TH : TaggedPDFConstants.TD;
+                COSObject cellObject = addStructElement(rowObject, cosDocument, cellTag, cell.getPageNumber());
+                if (isHeaderRow) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE,
+                        ASAtom.SCOPE, COSName.construct(ASAtom.getASAtom("Column")));
+                }
+                if (cell.getColSpan() != 1) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.COL_SPAN, COSInteger.construct(cell.getColSpan()));
+                }
+                if (cell.getRowSpan() != 1) {
+                    addAttributeToStructElem(cellObject, ASAtom.TABLE, ASAtom.ROW_SPAN, COSInteger.construct(cell.getRowSpan()));
+                }
+                addKids(cell.getContents(), cellObject, cosDocument);
+            }
+        }
     }
 
     private static void createStructElemForTextBlock(TableBorder table, COSObject parent, COSDocument cosDocument) {
